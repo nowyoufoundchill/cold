@@ -3,109 +3,332 @@ const fs = require("fs-extra");
 const path = require("path");
 const { ensureAudioFolder } = require("./utils/fileHelpers");
 
-const SUNO_COOKIE = process.env.SUNO_COOKIE;
-
-// Converts text prompt to a safe file prefix
+/**
+ * Converts text prompt to a safe file prefix
+ * @param {string} text - Input text to slugify
+ * @returns {string} - Slugified text
+ */
 const slugify = (text) =>
-  text.toLowerCase().replace(/[^a-z0-9]/g, "_").replace(/_+/g, "_").substring(0, 30);
+  text
+    .toLowerCase()
+    .replace(/[^a-z0-9]/g, "_")
+    .replace(/_+/g, "_")
+    .substring(0, 30);
 
-async function sunoAutomation(prompts) {
-  await ensureAudioFolder();
-
-  const browser = await puppeteer.launch({
+/**
+ * Automates music generation and downloading from Suno
+ * @param {string[]} prompts - Array of text prompts to generate music from
+ * @param {Object} options - Configuration options
+ * @returns {Promise<Array>} - Array of downloaded track information
+ */
+async function sunoAutomation(prompts, options = {}) {
+  // Default options
+  const config = {
+    tracksPerPrompt: 2,
+    instrumental: true,
     headless: "new",
-    args: ["--no-sandbox", "--disable-setuid-sandbox"],
+    downloadTimeout: 60000, // 1 minute for downloads
+    generationTimeout: 120000, // 2 minutes for generation
+    retryAttempts: 3,
+    ...options
+  };
+
+  const SUNO_COOKIE = process.env.SUNO_COOKIE;
+  if (!SUNO_COOKIE) {
+    throw new Error("SUNO_COOKIE environment variable is not set");
+  }
+
+  // Ensure audio folder exists
+  const audioFolder = await ensureAudioFolder();
+  console.log(`📁 Audio folder ready at: ${audioFolder}`);
+
+  // Track results for return
+  const results = [];
+
+  // Launch browser
+  const browser = await puppeteer.launch({
+    headless: config.headless,
+    args: ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"],
     executablePath: puppeteer.executablePath(),
   });
 
-  const page = await browser.newPage();
+  try {
+    // Create page with download behavior setup
+    const page = await browser.newPage();
+    
+    // Configure download behavior to save to our audio folder
+    await page._client().send("Page.setDownloadBehavior", {
+      behavior: "allow",
+      downloadPath: audioFolder,
+    });
+    
+    // Set viewport
+    await page.setViewport({ width: 1280, height: 800 });
 
-  // Set session cookie to authenticate
-  await page.setCookie({
-    name: "session",
-    value: SUNO_COOKIE,
-    domain: ".suno.com",
-    path: "/",
-    httpOnly: true,
-    secure: true,
+    // Set session cookie to authenticate
+    await page.setCookie({
+      name: "session",
+      value: SUNO_COOKIE,
+      domain: ".suno.com",
+      path: "/",
+      httpOnly: true,
+      secure: true,
+    });
+    console.log("✅ Logged into Suno with session");
+
+    // Setup download monitoring
+    const downloadMonitor = setupDownloadMonitor(page);
+
+    // Process each prompt
+    for (let promptIndex = 0; promptIndex < prompts.length; promptIndex++) {
+      const prompt = prompts[promptIndex];
+      console.log(`🎵 Processing prompt ${promptIndex + 1}/${prompts.length}: "${prompt}"`);
+      
+      const slug = slugify(prompt);
+      
+      // Generate multiple tracks per prompt
+      for (let trackNum = 1; trackNum <= config.tracksPerPrompt; trackNum++) {
+        const trackName = `${slug}-Track${trackNum}`;
+        let success = false;
+        let attempts = 0;
+        
+        // Retry logic
+        while (!success && attempts < config.retryAttempts) {
+          attempts++;
+          try {
+            console.log(`🎼 Generating: ${trackName} (Attempt ${attempts}/${config.retryAttempts})`);
+            
+            // Generate the track
+            await generateTrack(page, prompt, trackName, config);
+            
+            // Download the track
+            const downloadedFile = await downloadTrack(page, trackName, downloadMonitor, config.downloadTimeout);
+            
+            if (downloadedFile) {
+              results.push({
+                prompt,
+                trackName,
+                file: downloadedFile,
+                timestamp: new Date().toISOString()
+              });
+              success = true;
+              console.log(`✅ Successfully generated and downloaded: ${trackName}`);
+            }
+          } catch (error) {
+            console.error(`❌ Error processing ${trackName} (Attempt ${attempts}/${config.retryAttempts}):`, error.message);
+            
+            // If it's the last attempt, we'll just move on to the next track
+            if (attempts >= config.retryAttempts) {
+              console.error(`⚠️ Failed to process ${trackName} after ${config.retryAttempts} attempts. Moving to next track.`);
+            }
+            
+            // Wait briefly before retry
+            await page.waitForTimeout(2000);
+          }
+        }
+      }
+    }
+
+    return results;
+  } catch (error) {
+    console.error("❌ Fatal error in Suno automation:", error);
+    throw error;
+  } finally {
+    // Always close the browser
+    await browser.close();
+    console.log("✅ Suno automation complete.");
+  }
+}
+
+/**
+ * Setup download monitoring for the page
+ * @param {Page} page - Puppeteer page object
+ * @returns {Object} - Download monitor utility
+ */
+function setupDownloadMonitor(page) {
+  const downloads = new Map();
+  let downloadListener;
+
+  page.on('response', async (response) => {
+    const contentType = response.headers()['content-type'];
+    const contentDisposition = response.headers()['content-disposition'];
+    
+    // Check if this is a file download response
+    if (contentDisposition && contentDisposition.includes('attachment') && 
+        contentType && (contentType.includes('audio') || contentType.includes('application/octet-stream'))) {
+      
+      const filename = contentDisposition
+        .split('filename=')[1]
+        .replace(/["']/g, '')
+        .trim();
+      
+      if (downloadListener) {
+        downloadListener(filename);
+      }
+      
+      downloads.set(filename, {
+        url: response.url(),
+        startTime: Date.now(),
+        completed: false
+      });
+    }
   });
 
-  console.log("✅ Logged into Suno with session");
-
-  let trackIndex = 1;
-
-  for (const prompt of prompts) {
-    const slug = slugify(prompt);
-
-    for (let i = 1; i <= 2; i++) {
-      const trackName = `${slug}-Track${i}`;
-      console.log(`🎼 Generating: ${trackName}`);
-
-      await page.goto("https://suno.com/create?wid=default", { waitUntil: "networkidle2" });
-
-      // Wait and type into prompt field
-      await page.waitForSelector('textarea[placeholder="Enter style description"]', {
-        timeout: 15000,
+  return {
+    onDownloadStarted: (callback) => {
+      downloadListener = callback;
+    },
+    waitForDownload: async (trackName, timeout = 60000) => {
+      const startTime = Date.now();
+      
+      return new Promise((resolve, reject) => {
+        const checkInterval = setInterval(() => {
+          // Check all download entries for a match
+          for (const [filename, download] of downloads.entries()) {
+            if (filename.toLowerCase().includes(trackName.toLowerCase()) && !download.completed) {
+              download.completed = true;
+              clearInterval(checkInterval);
+              resolve(filename);
+              return;
+            }
+          }
+          
+          // Check timeout
+          if (Date.now() - startTime > timeout) {
+            clearInterval(checkInterval);
+            reject(new Error(`Download timeout for ${trackName}`));
+          }
+        }, 500);
       });
-      await page.type('textarea[placeholder="Enter style description"]', prompt);
+    }
+  };
+}
 
-      // Toggle "Instrumental"
+/**
+ * Generate a track on Suno
+ * @param {Page} page - Puppeteer page object
+ * @param {string} prompt - The text prompt for generation
+ * @param {string} trackName - The name for the track
+ * @param {Object} config - Configuration options
+ */
+async function generateTrack(page, prompt, trackName, config) {
+  // Go to create page
+  await page.goto("https://suno.com/create?wid=default", { 
+    waitUntil: "networkidle2",
+    timeout: 30000 
+  });
+
+  // Wait and type into prompt field
+  const promptSelector = 'textarea[placeholder="Enter style description"]';
+  await page.waitForSelector(promptSelector, { timeout: 15000 });
+  await page.type(promptSelector, prompt);
+
+  // Toggle "Instrumental" if requested
+  if (config.instrumental) {
+    try {
       const [instrumentalToggle] = await page.$x("//div[contains(text(), 'Instrumental')]");
       if (instrumentalToggle) {
         await instrumentalToggle.click();
         console.log("🎛️ Instrumental mode ON");
         await page.waitForTimeout(300);
       }
-
-      // Expand "More Options" and enter title
-      const [moreOptions] = await page.$x("//div[contains(text(), 'More Options')]");
-      if (moreOptions) {
-        await moreOptions.click();
-        await page.waitForTimeout(300);
-        await page.type('input[placeholder="Enter song title"]', trackName);
-      }
-
-      await page.click("#generate-button");
-      console.log(`⏳ Waiting for track: ${trackName}`);
-      await page.waitForTimeout(15000); // Wait for track generation (adjust if needed)
-
-      // Open library to get the download menu
-      await page.goto("https://suno.com/library?liked=true", { waitUntil: "networkidle2" });
-
-      const trackXpath = `//div[contains(text(), '${trackName}')]//ancestor::div[contains(@class, 'chakra-card')]//button[contains(@class, 'chakra-menu__menu-button')]`;
-      const [menuBtn] = await page.$x(trackXpath);
-      if (!menuBtn) {
-        console.warn(`⚠️ Could not find menu button for: ${trackName}`);
-        continue;
-      }
-
-      await menuBtn.click();
-      await page.waitForTimeout(500);
-
-      // Click "Download" > "MP3 Audio"
-      const [downloadOption] = await page.$x("//div[contains(text(), 'Download')]");
-      if (downloadOption) {
-        await downloadOption.hover();
-        await page.waitForTimeout(500);
-
-        const [mp3Option] = await page.$x("//div[contains(text(), 'MP3 Audio')]");
-        if (mp3Option) {
-          await mp3Option.click();
-          console.log(`⬇️ Download triggered: ${trackName}`);
-        } else {
-          console.warn("⚠️ MP3 option not found");
-        }
-      } else {
-        console.warn("⚠️ Download menu not found");
-      }
-
-      await page.waitForTimeout(10000); // Let the download complete
-      trackIndex++;
+    } catch (error) {
+      console.warn("⚠️ Couldn't toggle instrumental mode:", error.message);
     }
   }
 
-  await browser.close();
-  console.log("✅ Suno automation complete.");
+  // Expand "More Options" and enter title
+  try {
+    const [moreOptions] = await page.$x("//div[contains(text(), 'More Options')]");
+    if (moreOptions) {
+      await moreOptions.click();
+      await page.waitForTimeout(500);
+      
+      const titleInput = await page.$('input[placeholder="Enter song title"]');
+      if (titleInput) {
+        await titleInput.type(trackName);
+      }
+    }
+  } catch (error) {
+    console.warn("⚠️ Couldn't set track title:", error.message);
+  }
+
+  // Click generate button and wait for generation
+  const generateButton = await page.$("#generate-button");
+  if (!generateButton) {
+    throw new Error("Generate button not found");
+  }
+  
+  await generateButton.click();
+  console.log(`⏳ Waiting for track generation: ${trackName}`);
+  
+  // Wait for minimum time for generation to complete
+  await page.waitForTimeout(config.generationTimeout);
+}
+
+/**
+ * Download a track from Suno library
+ * @param {Page} page - Puppeteer page object
+ * @param {string} trackName - The name of the track to download
+ * @param {Object} downloadMonitor - Download monitor utility
+ * @param {number} timeout - Download timeout in milliseconds
+ * @returns {Promise<string>} - The name of the downloaded file
+ */
+async function downloadTrack(page, trackName, downloadMonitor, timeout) {
+  // Go to library
+  await page.goto("https://suno.com/library?liked=true", { 
+    waitUntil: "networkidle2",
+    timeout: 30000
+  });
+  
+  // Wait for library to load
+  await page.waitForTimeout(2000);
+
+  // Look for the track in the library
+  const trackXPath = `//div[contains(text(), '${trackName}')]//ancestor::div[contains(@class, 'chakra-card')]//button[contains(@class, 'chakra-menu__menu-button')]`;
+  
+  // Wait for the menu button to appear
+  const menuButtons = await page.$x(trackXPath);
+  if (menuButtons.length === 0) {
+    throw new Error(`Track "${trackName}" not found in library`);
+  }
+  
+  // Set up download listener
+  let downloadedFile = null;
+  downloadMonitor.onDownloadStarted((filename) => {
+    if (filename.toLowerCase().includes(trackName.toLowerCase())) {
+      downloadedFile = filename;
+    }
+  });
+  
+  // Click menu button
+  await menuButtons[0].click();
+  await page.waitForTimeout(500);
+  
+  // Click "Download" > "MP3 Audio"
+  const [downloadOption] = await page.$x("//div[contains(text(), 'Download')]");
+  if (!downloadOption) {
+    throw new Error("Download menu option not found");
+  }
+  
+  await downloadOption.hover();
+  await page.waitForTimeout(500);
+  
+  const [mp3Option] = await page.$x("//div[contains(text(), 'MP3 Audio')]");
+  if (!mp3Option) {
+    throw new Error("MP3 Audio option not found");
+  }
+  
+  await mp3Option.click();
+  console.log(`⬇️ Download triggered: ${trackName}`);
+  
+  // Wait for download to complete
+  try {
+    const filename = await downloadMonitor.waitForDownload(trackName, timeout);
+    return filename;
+  } catch (error) {
+    throw new Error(`Download failed: ${error.message}`);
+  }
 }
 
 module.exports = sunoAutomation;
